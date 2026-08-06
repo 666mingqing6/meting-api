@@ -383,24 +383,21 @@ async function handleLrc(id) {
   return data.lrc ? (data.lrc.lyric || '') : '';
 }
 
-// 网易云搜索（通过 weapi，替代失效的 GD Studio 搜索接口）
+// 网易云搜索（多级回退，提升健壮性）
+// 方案1: weapi/cloudsearch（新版加密搜索）
+// 方案2: 旧版 GET 搜索接口（不需要加密，作为 fallback）
 async function handleSearch(keyword, workerOrigin, limit = 30) {
-  const data = await weapiRequest('/weapi/cloudsearch/get/web', {
-    s: keyword,
-    type: 1,
-    limit: limit,
-    offset: 0,
-  });
-  if (!data || !data.result || !data.result.songs) return [];
-  return data.result.songs.map(song => {
-    const picUrl = (song.al && song.al.picUrl) ? song.al.picUrl : '';
+  const mapSong = (song, isWeapi) => {
+    const ar = isWeapi ? (song.ar || []) : (song.artists || []);
+    const al = isWeapi ? song.al : song.album;
+    const picUrl = (al && al.picUrl) ? al.picUrl : (al && al.picId ? `https://p1.music.126.net/${al.picId}/${al.picId}.jpg` : '');
     const picId = extractPicId(picUrl) || song.id;
     const picSrc = picUrl ? `&src=${encodeURIComponent(picUrl)}` : '';
     return {
       id: song.id,
       name: song.name,
-      artist: (song.ar || []).map(a => a.name).join('/'),
-      album: (song.al && song.al.name) ? song.al.name : '',
+      artist: ar.map(a => a.name).join('/'),
+      album: (al && al.name) ? al.name : '',
       pic_id: picId,
       lyric_id: song.id,
       pic: `${workerOrigin}?server=netease&type=pic&id=${picId}${picSrc}`,
@@ -408,7 +405,29 @@ async function handleSearch(keyword, workerOrigin, limit = 30) {
       lrc: `${workerOrigin}?server=netease&type=lrc&id=${song.id}`,
       source: 'netease',
     };
-  });
+  };
+
+  // 方案1: weapi/cloudsearch
+  try {
+    const data = await weapiRequest('/weapi/cloudsearch/get/web', {
+      s: keyword, type: 1, limit, offset: 0,
+    });
+    if (data && data.result && data.result.songs && data.result.songs.length > 0) {
+      return data.result.songs.map(s => mapSong(s, true));
+    }
+  } catch (e) { /* 继续回退 */ }
+
+  // 方案2: 旧版搜索接口（GET，不需要 weapi 加密）
+  try {
+    const searchUrl = `https://music.163.com/api/search/get?s=${encodeURIComponent(keyword)}&type=1&offset=0&limit=${limit}`;
+    const resp = await fetch(searchUrl, { headers: buildHeaders() });
+    const data = await resp.json();
+    if (data && data.result && data.result.songs && data.result.songs.length > 0) {
+      return data.result.songs.map(s => mapSong(s, false));
+    }
+  } catch (e) { /* 继续回退 */ }
+
+  return [];
 }
 
 // ============================================================
