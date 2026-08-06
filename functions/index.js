@@ -428,7 +428,8 @@ async function handleRequest(request) {
   const type = searchParams.get('type') || 'playlist';
   const id = searchParams.get('id');
 
-  if (!id) {
+  // search 接口使用 keyword 参数，不需要 id；其余接口必须有 id
+  if (!id && type !== 'search') {
     return new Response(
       JSON.stringify({ error: 'missing id parameter' }),
       { status: 400, headers: { ...CORS, 'Content-Type': 'application/json; charset=utf-8' } }
