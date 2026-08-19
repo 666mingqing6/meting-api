@@ -1,0 +1,25 @@
+# ============================================================
+#  Cloudflare Workers 部署配置 — 自建 Meting API
+# ============================================================
+#
+#  仓库地址：https://github.com/666mingqing6/meting-api
+#  在线地址：https://meting-api.646474.xyz/
+#  用途：对接网易云音乐 weapi，提供 playlist/song/url/pic/lrc/search 接口
+#  525 封锁解决：直连失败自动走 proxy.646474.xyz 转发（见 index.js neteaseFetch）
+#
+#  部署：npx wrangler deploy
+#  （需先 wrangler login，或在 CI 中配置 CLOUDFLARE_API_TOKEN）
+# ============================================================
+
+name = "meting-api"
+main = "index.js"
+compatibility_date = "2025-01-01"
+
+# 可观测性：Workers 日志（Dashboard → Workers → meting-api → Logs 查看）
+[observability]
+enabled = true
+
+# 免费计划：每天 10 万次请求，个人音乐播放器绰绰有余
+# 自定义域名 meting-api.646474.xyz 通过 Dashboard 绑定：
+#   Workers & Pages → meting-api → Settings → Domains & Routes → Add Custom Domain
+# 国内访问：域名 NS 委派到华为云 DNS，大陆 A 记录直指 CF IP（详见 README）

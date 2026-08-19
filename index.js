@@ -1,23 +1,82 @@
 /**
- * 腾讯云 EdgeOne 边缘函数 — 自建 Meting API
+ * Cloudflare Workers - Self-hosted Meting API
  *
- * 替代 Cloudflare Workers 版本（CF Worker 到 music.163.com 的 TLS 握手被 525 封锁）。
- * EdgeOne 边缘节点为腾讯国内 IP，不被网易云封锁，可正常 fetch weapi。
+ * Talks to NetEase Cloud Music weapi directly.
+ * Supports 6 types: playlist / song / url / pic / lrc / search.
+ * url endpoint supports format=json to return the real CDN address
+ * (used by the player to download a blob for audio effects).
  *
- * 部署步骤：
- *   1. 登录腾讯云 EdgeOne 控制台 → 站点 → 边缘函数 → 创建函数
- *   2. 将本文件内容粘贴进去，函数名随意（如 meting-api）
- *   3. 触发规则：匹配 Host 等于你的加速域名（如 meting-api.646474.xyz），
- *      路径匹配全部（或正则 .*）
- *   4. 需要先在 EdgeOne 接入该域名（DNS 接入或 CNAME 接入）
- *   5. 部署后将 js/player.js 的 apiUrl 指向 EdgeOne 加速域名
+ * 525 blocking solution:
+ *   NetEase blocks Cloudflare IP ranges (fetch music.163.com fails with
+ *   525 SSL handshake errors). All upstream requests go through
+ *   neteaseFetch() with multi-level fallback:
+ *     1. Direct connection to music.163.com (fastest when CF IP is fine)
+ *     2. On failure (network error or 521/522/523/525/530) retry through
+ *        proxy.646474.xyz (verified to forward weapi encrypted POSTs fully)
+ *     3. After a direct failure, a 5-minute circuit breaker kicks in so
+ *        subsequent requests go straight to the proxy without waiting
+ *        for the direct timeout
  *
- * 与 Cloudflare Workers 版本的差异：仅入口语法不同（addEventListener vs export default），
- * 加密/weapi/handler 逻辑完全一致。
+ * Deploy:
+ *   A. Cloudflare Dashboard: Workers & Pages -> Create -> paste this file
+ *   B. wrangler CLI: wrangler deploy
+ *   C. Cloudflare API (see repo README)
+ *
+ * Bind custom domain meting-api.646474.xyz afterwards
+ * (Workers -> Settings -> Domains & Routes). js/player.js apiUrl stays unchanged.
  */
 
 // ============================================================
-//  MD5 (RFC 1321) — 纯 JS，Web Crypto 不支持 MD5
+//  Upstream access (direct + proxy multi-level fallback)
+// ============================================================
+
+const PROXY_PREFIX = 'https://proxy.646474.xyz/';
+
+// Circuit breaker: cooldown after a direct-connection failure
+// (isolate-level shared, tracks upstream health, not request state)
+let _directFailedUntil = 0;
+const DIRECT_BLOCK_MS = 5 * 60 * 1000;
+
+// Cloudflare edge-to-origin connection failure status codes
+// (525 = SSL handshake failure, i.e. NetEase blocking the CF IP)
+function isEdgeConnError(status) {
+  return status === 521 || status === 522 || status === 523 || status === 525 || status === 530;
+}
+
+async function fetchWithTimeout(url, init, ms) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Unified entry for requests to music.163.com: direct first, proxy on failure
+async function neteaseFetch(url, init = {}, timeoutMs = 15000) {
+  const now = Date.now();
+
+  if (now >= _directFailedUntil) {
+    try {
+      const resp = await fetchWithTimeout(url, init, 6000);
+      if (!isEdgeConnError(resp.status)) {
+        return resp; // direct connection OK
+      }
+      // 52x edge error: consume body to release the connection, fall to proxy
+      await resp.text().catch(() => {});
+    } catch (e) {
+      // fetch error (timeout/DNS/TLS): fall to proxy
+    }
+    // Direct unavailable: open the circuit breaker
+    _directFailedUntil = now + DIRECT_BLOCK_MS;
+  }
+
+  return fetchWithTimeout(PROXY_PREFIX + url, init, timeoutMs);
+}
+
+// ============================================================
+//  MD5 (RFC 1321) - pure JS, Web Crypto has no MD5
 // ============================================================
 
 function md5Raw(input) {
@@ -175,7 +234,7 @@ function rsaEncrypt(text) {
 }
 
 // ============================================================
-//  Netease weapi encryption
+//  NetEase weapi encryption
 // ============================================================
 
 const NONCE = '0CoJUm6Qyw8W8jud';
@@ -206,7 +265,7 @@ async function weapiEncrypt(object) {
 }
 
 // ============================================================
-//  Netease API 请求
+//  NetEase API requests
 // ============================================================
 
 function randomChinaIP() {
@@ -230,17 +289,23 @@ async function weapiRequest(path, body) {
   const encrypted = await weapiEncrypt(body);
   const formBody = `params=${encodeURIComponent(encrypted.params)}&encSecKey=${encodeURIComponent(encrypted.encSecKey)}`;
 
-  const url = `https://music.163.com${path}`;
-  const resp = await fetch(url, {
+  const resp = await neteaseFetch(`https://music.163.com${path}`, {
     method: 'POST',
     headers: buildHeaders(),
     body: formBody,
   });
-  return resp.json();
+
+  const text = await resp.text();
+  try {
+    return JSON.parse(text);
+  } catch (e) {
+    // NetEase risk-control may return an HTML error page; surface a diagnosable error
+    throw new Error(`netease returned non-JSON (HTTP ${resp.status}): ${text.slice(0, 120)}`);
+  }
 }
 
 // ============================================================
-//  netease_encryptId — 用于构造图片直链
+//  netease_encryptId - used to build direct image URLs
 // ============================================================
 
 function neteaseEncryptId(id) {
@@ -261,7 +326,7 @@ function extractPicId(picUrl) {
 }
 
 // ============================================================
-//  API 处理器
+//  API handlers
 // ============================================================
 
 const CORS = {
@@ -334,7 +399,8 @@ async function handleSong(id, workerOrigin) {
 }
 
 async function handleUrl(id, format) {
-  // format=json：调用 weapi 获取真实 CDN 地址（用于音效模式下浏览器下载 blob）
+  // format=json: call weapi to get the real CDN address
+  // (used by the player in audio-effect mode to download a blob)
   if (format === 'json') {
     try {
       const data = await weapiRequest('/weapi/song/enhance/player/url/v1', {
@@ -347,18 +413,19 @@ async function handleUrl(id, format) {
       if (d && d.url) {
         return { ok: true, url: d.url, size: d.size, type: d.type };
       }
-      // weapi 未返回（无版权/VIP/海外风控），回退到公开直链
+      // weapi returned nothing (no license / VIP / risk control): fall back to the public link
       return { ok: false, error: 'no url from weapi', url: `https://music.163.com/song/media/outer/url?id=${id}.mp3` };
     } catch (e) {
       return { ok: false, error: e.message || 'weapi error', url: `https://music.163.com/song/media/outer/url?id=${id}.mp3` };
     }
   }
-  // 默认：302 重定向到公开直链，让浏览器自己的 IP 跟网易云 302，最稳定
+  // Default: 302 redirect to the public link so the browser's own IP follows NetEase's redirect (most stable)
   const publicUrl = `https://music.163.com/song/media/outer/url?id=${id}.mp3`;
   return { ok: true, url: publicUrl };
 }
 
 async function handlePic(id, src) {
+  // Prefer the real picUrl passed via the src parameter (provided by playlist/song endpoints)
   if (src) {
     let url = decodeURIComponent(src);
     url = url.replace(/param=\d+y\d+/, 'param=800y800');
@@ -383,9 +450,9 @@ async function handleLrc(id) {
   return data.lrc ? (data.lrc.lyric || '') : '';
 }
 
-// 网易云搜索（多级回退，提升健壮性）
-// 方案1: weapi/cloudsearch（新版加密搜索）
-// 方案2: 旧版 GET 搜索接口（不需要加密，作为 fallback）
+// NetEase search (multi-level fallback for robustness)
+// Plan 1: weapi/cloudsearch (new encrypted search)
+// Plan 2: legacy GET search endpoint (no encryption needed, as fallback)
 async function handleSearch(keyword, workerOrigin, limit = 30) {
   const mapSong = (song, isWeapi) => {
     const ar = isWeapi ? (song.ar || []) : (song.artists || []);
@@ -407,7 +474,7 @@ async function handleSearch(keyword, workerOrigin, limit = 30) {
     };
   };
 
-  // 方案1: weapi/cloudsearch
+  // Plan 1: weapi/cloudsearch
   try {
     const data = await weapiRequest('/weapi/cloudsearch/get/web', {
       s: keyword, type: 1, limit, offset: 0,
@@ -415,130 +482,128 @@ async function handleSearch(keyword, workerOrigin, limit = 30) {
     if (data && data.result && data.result.songs && data.result.songs.length > 0) {
       return data.result.songs.map(s => mapSong(s, true));
     }
-  } catch (e) { /* 继续回退 */ }
+  } catch (e) { /* fall through */ }
 
-  // 方案2: 旧版搜索接口（GET，不需要 weapi 加密）
+  // Plan 2: legacy search endpoint (GET, no weapi encryption)
   try {
     const searchUrl = `https://music.163.com/api/search/get?s=${encodeURIComponent(keyword)}&type=1&offset=0&limit=${limit}`;
-    const resp = await fetch(searchUrl, { headers: buildHeaders() });
+    const resp = await neteaseFetch(searchUrl, { headers: buildHeaders() });
     const data = await resp.json();
     if (data && data.result && data.result.songs && data.result.songs.length > 0) {
       return data.result.songs.map(s => mapSong(s, false));
     }
-  } catch (e) { /* 继续回退 */ }
+  } catch (e) { /* fall through */ }
 
   return [];
 }
 
 // ============================================================
-//  EdgeOne 边缘函数入口
+//  Worker entry (ES Module format)
 // ============================================================
 
-async function handleRequest(request) {
-  const url = new URL(request.url);
-  const { searchParams } = url;
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    const { searchParams } = url;
 
-  // OPTIONS 预检
-  if (request.method === 'OPTIONS') {
-    return new Response(null, { headers: CORS });
-  }
+    // OPTIONS preflight
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { headers: CORS });
+    }
 
-  const server = searchParams.get('server') || 'netease';
-  const type = searchParams.get('type') || 'playlist';
-  const id = searchParams.get('id');
+    const server = searchParams.get('server') || 'netease';
+    const type = searchParams.get('type') || 'playlist';
+    const id = searchParams.get('id');
 
-  // search 接口使用 keyword 参数，不需要 id；其余接口必须有 id
-  if (!id && type !== 'search') {
-    return new Response(
-      JSON.stringify({ error: 'missing id parameter' }),
-      { status: 400, headers: { ...CORS, 'Content-Type': 'application/json; charset=utf-8' } }
-    );
-  }
+    // search uses the keyword parameter and needs no id; others require id
+    if (!id && type !== 'search') {
+      return new Response(
+        JSON.stringify({ error: 'missing id parameter' }),
+        { status: 400, headers: { ...CORS, 'Content-Type': 'application/json; charset=utf-8' } }
+      );
+    }
 
-  if (server !== 'netease') {
-    return new Response(
-      JSON.stringify({ error: `server "${server}" not yet supported` }),
-      { status: 400, headers: { ...CORS, 'Content-Type': 'application/json; charset=utf-8' } }
-    );
-  }
+    if (server !== 'netease') {
+      return new Response(
+        JSON.stringify({ error: `server "${server}" not yet supported` }),
+        { status: 400, headers: { ...CORS, 'Content-Type': 'application/json; charset=utf-8' } }
+      );
+    }
 
-  try {
-    switch (type) {
-      case 'playlist': {
-        const result = await handlePlaylist(id, url.origin);
-        return new Response(JSON.stringify(result), {
-          headers: { ...CORS, 'Content-Type': 'application/json; charset=utf-8' },
-        });
-      }
-
-      case 'song': {
-        const result = await handleSong(id, url.origin);
-        return new Response(JSON.stringify(result), {
-          headers: { ...CORS, 'Content-Type': 'application/json; charset=utf-8' },
-        });
-      }
-
-      case 'url': {
-        const format = searchParams.get('format');
-        const result = await handleUrl(id, format);
-        // format=json 模式：返回 JSON（含真实 CDN URL，供播放器下载 blob 用）
-        if (format === 'json') {
+    try {
+      switch (type) {
+        case 'playlist': {
+          const result = await handlePlaylist(id, url.origin);
           return new Response(JSON.stringify(result), {
             headers: { ...CORS, 'Content-Type': 'application/json; charset=utf-8' },
           });
         }
-        // 默认模式：302 重定向
-        if (result && result.ok) {
-          return Response.redirect(result.url, 302);
+
+        case 'song': {
+          const result = await handleSong(id, url.origin);
+          return new Response(JSON.stringify(result), {
+            headers: { ...CORS, 'Content-Type': 'application/json; charset=utf-8' },
+          });
         }
-        return new Response(JSON.stringify(result || { error: 'url not found' }), {
-          status: 404,
-          headers: { ...CORS, 'Content-Type': 'application/json; charset=utf-8' },
-        });
-      }
 
-      case 'pic': {
-        const src = searchParams.get('src');
-        const picUrl = await handlePic(id, src);
-        if (picUrl) {
-          return Response.redirect(picUrl, 302);
+        case 'url': {
+          const format = searchParams.get('format');
+          const result = await handleUrl(id, format);
+          // format=json mode: return JSON (with the real CDN URL for the player's blob download)
+          if (format === 'json') {
+            return new Response(JSON.stringify(result), {
+              headers: { ...CORS, 'Content-Type': 'application/json; charset=utf-8' },
+            });
+          }
+          // Default mode: 302 redirect
+          if (result && result.ok) {
+            return Response.redirect(result.url, 302);
+          }
+          return new Response(JSON.stringify(result || { error: 'url not found' }), {
+            status: 404,
+            headers: { ...CORS, 'Content-Type': 'application/json; charset=utf-8' },
+          });
         }
-        return new Response(JSON.stringify({ error: 'pic not found' }), {
-          status: 404,
-          headers: { ...CORS, 'Content-Type': 'application/json; charset=utf-8' },
-        });
-      }
 
-      case 'lrc': {
-        const lrc = await handleLrc(id);
-        return new Response(lrc || '[00:00.00]暂无歌词', {
-          headers: { ...CORS, 'Content-Type': 'text/plain; charset=utf-8' },
-        });
-      }
+        case 'pic': {
+          const src = searchParams.get('src');
+          const picUrl = await handlePic(id, src);
+          if (picUrl) {
+            return Response.redirect(picUrl, 302);
+          }
+          return new Response(JSON.stringify({ error: 'pic not found' }), {
+            status: 404,
+            headers: { ...CORS, 'Content-Type': 'application/json; charset=utf-8' },
+          });
+        }
 
-      case 'search': {
-        // 搜索接口：type=search&keyword=xxx
-        const keyword = searchParams.get('keyword') || searchParams.get('name') || id;
-        const result = await handleSearch(keyword, url.origin);
-        return new Response(JSON.stringify(result), {
-          headers: { ...CORS, 'Content-Type': 'application/json; charset=utf-8' },
-        });
-      }
+        case 'lrc': {
+          const lrc = await handleLrc(id);
+          // \u6682\u65e0\u6b4c\u8bcd = "no lyrics yet" (unicode-escaped to keep source pure ASCII)
+          return new Response(lrc || '[00:00.00]\u6682\u65e0\u6b4c\u8bcd', {
+            headers: { ...CORS, 'Content-Type': 'text/plain; charset=utf-8' },
+          });
+        }
 
-      default:
-        return new Response(
-          JSON.stringify({ error: `unknown type "${type}"` }),
-          { status: 400, headers: { ...CORS, 'Content-Type': 'application/json; charset=utf-8' } }
-        );
+        case 'search': {
+          const keyword = searchParams.get('keyword') || searchParams.get('name') || id;
+          const result = await handleSearch(keyword, url.origin);
+          return new Response(JSON.stringify(result), {
+            headers: { ...CORS, 'Content-Type': 'application/json; charset=utf-8' },
+          });
+        }
+
+        default:
+          return new Response(
+            JSON.stringify({ error: `unknown type "${type}"` }),
+            { status: 400, headers: { ...CORS, 'Content-Type': 'application/json; charset=utf-8' } }
+          );
+      }
+    } catch (err) {
+      return new Response(
+        JSON.stringify({ error: err.message || 'internal error' }),
+        { status: 500, headers: { ...CORS, 'Content-Type': 'application/json; charset=utf-8' } }
+      );
     }
-  } catch (err) {
-    return new Response(
-      JSON.stringify({ error: err.message || 'internal error' }),
-      { status: 500, headers: { ...CORS, 'Content-Type': 'application/json; charset=utf-8' } }
-    );
-  }
-}
-
-export async function onRequest(context) {
-  return handleRequest(context.request);
-}
+  },
+};
