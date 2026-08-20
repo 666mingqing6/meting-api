@@ -498,6 +498,243 @@ async function handleSearch(keyword, workerOrigin, limit = 30) {
 }
 
 // ============================================================
+//  User & auth API (D1-backed)
+//    POST /auth/register     {username, password} -> {token}
+//    POST /auth/login        {username, password} -> {token}
+//    POST /auth/logout       (Bearer) -> 204
+//    GET  /user/playcounts   (Bearer) -> {counts}
+//    PUT  /user/playcounts   (Bearer) {counts} -> full replace
+// ============================================================
+
+const USER_CORS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, PUT, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+};
+
+const SESSION_TTL = 90 * 24 * 3600; // 90 days
+const MAX_COUNT_ROWS = 3000;        // per user, guard against abuse
+
+function userJson(obj, status = 200) {
+  return new Response(JSON.stringify(obj), {
+    status,
+    headers: { ...USER_CORS, 'Content-Type': 'application/json; charset=utf-8' },
+  });
+}
+
+function toHex(bytes) {
+  return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// PBKDF2-SHA256, returns "saltHex:hashHex" (100k iterations, 256-bit)
+async function hashPassword(password) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', hash: 'SHA-256', salt, iterations: 100000 }, key, 256
+  );
+  return toHex(salt) + ':' + toHex(new Uint8Array(bits));
+}
+
+async function verifyPassword(password, stored) {
+  const parts = stored.split(':');
+  if (parts.length !== 2) return false;
+  const [saltHex, hashHex] = parts;
+  const salt = new Uint8Array(saltHex.match(/.{2}/g).map(h => parseInt(h, 16)));
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', hash: 'SHA-256', salt, iterations: 100000 }, key, 256
+  );
+  const got = toHex(new Uint8Array(bits));
+  if (got.length !== hashHex.length) return false;
+  let diff = 0;
+  for (let i = 0; i < got.length; i++) diff |= got.charCodeAt(i) ^ hashHex.charCodeAt(i);
+  return diff === 0;
+}
+
+function newToken() {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  return toHex(bytes);
+}
+
+function clientIp(request) {
+  return (request.headers.get('CF-Connecting-IP') || '0.0.0.0').slice(0, 45);
+}
+
+// Login throttle: 10 failures per 10-minute window per IP
+async function throttleCheck(db, ip) {
+  const now = Math.floor(Date.now() / 1000);
+  const row = await db.prepare('SELECT fails, window_start FROM login_throttle WHERE ip = ?').bind(ip).first();
+  if (!row) return true;
+  if (now - row.window_start > 600) {
+    await db.prepare('DELETE FROM login_throttle WHERE ip = ?').bind(ip).run();
+    return true;
+  }
+  return row.fails < 10;
+}
+
+async function throttleFail(db, ip) {
+  const now = Math.floor(Date.now() / 1000);
+  await db.prepare(`
+    INSERT INTO login_throttle (ip, fails, window_start) VALUES (?, 1, ?)
+    ON CONFLICT(ip) DO UPDATE SET fails = fails + 1
+  `).bind(ip, now).run();
+}
+
+async function throttleClear(db, ip) {
+  await db.prepare('DELETE FROM login_throttle WHERE ip = ?').bind(ip).run();
+}
+
+// Resolve Bearer token -> {userId, username}, or null
+async function getSessionUser(db, request) {
+  const auth = request.headers.get('Authorization') || '';
+  const token = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
+  if (!/^[0-9a-f]{64}$/.test(token)) return null;
+  const row = await db.prepare(`
+    SELECT s.token, s.expires_at, u.id AS uid, u.username
+    FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ?
+  `).bind(token).first();
+  if (!row) return null;
+  if (Math.floor(Date.now() / 1000) > row.expires_at) {
+    await db.prepare('DELETE FROM sessions WHERE token = ?').bind(token).run();
+    return null;
+  }
+  return { userId: row.uid, username: row.username, token };
+}
+
+function validateCredentials(username, password) {
+  if (typeof username !== 'string' || typeof password !== 'string') return 'invalid payload';
+  if (!/^[a-zA-Z0-9_\u4e00-\u9fa5]{2,24}$/.test(username)) {
+    return 'username must be 2-24 chars (letters, digits, _, CJK)';
+  }
+  if (password.length < 6 || password.length > 128) {
+    return 'password must be 6-128 chars';
+  }
+  return null;
+}
+
+// Validate the {counts} payload: {songKey: integer}
+function sanitizeCounts(input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return null;
+  const out = [];
+  for (const key of Object.keys(input)) {
+    if (!/^[a-zA-Z0-9_:|.\-\/%]{1,300}$/.test(key)) return null;
+    const v = input[key];
+    if (typeof v !== 'number' || !Number.isInteger(v) || v < 0 || v > 999999) return null;
+    out.push([key, v]);
+  }
+  if (out.length > MAX_COUNT_ROWS) return null;
+  return out;
+}
+
+async function handleUserApi(request, env) {
+  const db = env.DB;
+  if (!db) {
+    return userJson({ error: 'D1 binding missing' }, 500);
+  }
+
+  const url = new URL(request.url);
+  const path = url.pathname;
+  const ip = clientIp(request);
+
+  if (request.method === 'OPTIONS') {
+    return new Response(null, { headers: USER_CORS });
+  }
+
+  try {
+    // ---- POST /auth/register ----
+    if (path === '/auth/register' && request.method === 'POST') {
+      const body = await request.json().catch(() => null);
+      const username = body && body.username;
+      const password = body && body.password;
+      const err = validateCredentials(username, password);
+      if (err) return userJson({ error: err }, 400);
+
+      const exists = await db.prepare('SELECT id FROM users WHERE username = ?').bind(username).first();
+      if (exists) return userJson({ error: 'username already taken' }, 409);
+
+      const hash = await hashPassword(password);
+      const inserted = await db.prepare('INSERT INTO users (username, password_hash) VALUES (?, ?)').bind(username, hash).run();
+      const userId = inserted.meta && inserted.meta.last_row_id;
+
+      const token = newToken();
+      const exp = Math.floor(Date.now() / 1000) + SESSION_TTL;
+      await db.prepare('INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, ?)').bind(token, userId, exp).run();
+      return userJson({ token, username, expires_at: exp }, 201);
+    }
+
+    // ---- POST /auth/login ----
+    if (path === '/auth/login' && request.method === 'POST') {
+      if (!(await throttleCheck(db, ip))) {
+        return userJson({ error: 'too many attempts, retry in 10 minutes' }, 429);
+      }
+      const body = await request.json().catch(() => null);
+      const username = body && body.username;
+      const password = body && body.password;
+      const err = validateCredentials(username, password);
+      if (err) return userJson({ error: err }, 400);
+
+      const row = await db.prepare('SELECT id, username, password_hash FROM users WHERE username = ?').bind(username).first();
+      if (!row || !(await verifyPassword(password, row.password_hash))) {
+        await throttleFail(db, ip);
+        return userJson({ error: 'wrong username or password' }, 401);
+      }
+
+      await throttleClear(db, ip);
+      const token = newToken();
+      const exp = Math.floor(Date.now() / 1000) + SESSION_TTL;
+      await db.prepare('INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, ?)').bind(token, row.id, exp).run();
+      return userJson({ token, username: row.username, expires_at: exp });
+    }
+
+    // ---- POST /auth/logout ----
+    if (path === '/auth/logout' && request.method === 'POST') {
+      const session = await getSessionUser(db, request);
+      if (session) {
+        await db.prepare('DELETE FROM sessions WHERE token = ?').bind(session.token).run();
+      }
+      return new Response(null, { status: 204, headers: USER_CORS });
+    }
+
+    // ---- GET /user/playcounts ----
+    if (path === '/user/playcounts' && request.method === 'GET') {
+      const session = await getSessionUser(db, request);
+      if (!session) return userJson({ error: 'unauthorized' }, 401);
+      const result = await db.prepare('SELECT song_key, count FROM play_counts WHERE user_id = ?').bind(session.userId).all();
+      const counts = {};
+      for (const r of result.results || []) counts[r.song_key] = r.count;
+      return userJson({ counts, username: session.username });
+    }
+
+    // ---- PUT /user/playcounts ----
+    if (path === '/user/playcounts' && request.method === 'PUT') {
+      const session = await getSessionUser(db, request);
+      if (!session) return userJson({ error: 'unauthorized' }, 401);
+      const body = await request.json().catch(() => null);
+      const entries = sanitizeCounts(body && body.counts);
+      if (!entries) return userJson({ error: 'invalid counts payload' }, 400);
+
+      // Full replace (idempotent; client is the source of truth)
+      const stmts = [
+        db.prepare('DELETE FROM play_counts WHERE user_id = ?').bind(session.userId),
+      ];
+      for (const [key, count] of entries) {
+        stmts.push(db.prepare('INSERT INTO play_counts (user_id, song_key, count) VALUES (?, ?, ?)').bind(session.userId, key, count));
+      }
+      await db.batch(stmts);
+      return userJson({ ok: true, saved: entries.length });
+    }
+
+    return userJson({ error: 'not found' }, 404);
+  } catch (e) {
+    return userJson({ error: e.message || 'internal error' }, 500);
+  }
+}
+
+// ============================================================
 //  Worker entry (ES Module format)
 // ============================================================
 
@@ -506,7 +743,16 @@ export default {
     const url = new URL(request.url);
     const { searchParams } = url;
 
-    // OPTIONS preflight
+    // User/account API (path-based routing, backed by D1 binding "DB")
+    // Routed before the legacy query-string API; paths never collide
+    // because the legacy API only reacts to ?type= parameters.
+    const path = url.pathname;
+    if (path === '/auth/register' || path === '/auth/login' ||
+        path === '/auth/logout' || path === '/user/playcounts') {
+      return handleUserApi(request, env);
+    }
+
+    // OPTIONS preflight (legacy meting API)
     if (request.method === 'OPTIONS') {
       return new Response(null, { headers: CORS });
     }

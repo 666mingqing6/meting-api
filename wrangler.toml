@@ -15,6 +15,14 @@ name = "meting-api"
 main = "index.js"
 compatibility_date = "2025-01-01"
 
+# D1 数据库：账户系统 + 播放计数云端同步
+# 首次部署需先建库：wrangler d1 create meting-users
+# 再执行表结构：wrangler d1 execute meting-users --file=./schema.sql --remote
+[[d1_databases]]
+binding = "DB"
+database_name = "meting-users"
+database_id = "c8c23ef8-0949-4e93-8607-54f41cb0df3a"
+
 # 可观测性：Workers 日志（Dashboard → Workers → meting-api → Logs 查看）
 [observability]
 enabled = true

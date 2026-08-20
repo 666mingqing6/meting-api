@@ -1,6 +1,6 @@
 # Meting API — Cloudflare Workers
 
-自建网易云音乐 API，部署在 **Cloudflare Workers** 上（Worker 名称：`meting-api`）。
+自建网易云音乐 API + 账户系统，部署在 **Cloudflare Workers** 上（Worker 名称：`meting-api`，D1 数据库：`meting-users`）。
 
 在线地址：https://meting-api.646474.xyz/
 
@@ -8,11 +8,12 @@
 
 ```
 ├── index.js       # Worker 主代码（ES Module 格式，纯 ASCII 源码）
-├── wrangler.toml  # wrangler 部署配置
+├── schema.sql     # D1 数据库表结构（users / sessions / play_counts / login_throttle）
+├── wrangler.toml  # wrangler 部署配置（含 D1 binding）
 └── README.md
 ```
 
-## API 接口
+## 音乐 API（query 参数路由）
 
 | 参数 | 说明 | 示例 |
 |------|------|------|
@@ -41,13 +42,29 @@ https://meting-api.646474.xyz/?server=netease&type=url&id=186016
 https://meting-api.646474.xyz/?server=netease&type=url&id=186016&format=json
 ```
 
-### 接口说明
+## 账户 API（path 路由，D1 支持）
 
-- **playlist / song / search**：调用网易云 weapi 加密接口（AES-128-CBC 双重加密 + RSA），纯 JS 实现，无外部依赖
-- **url**：默认 302 到网易云公开直链（`music.163.com/song/media/outer/url?id=xxx.mp3`）；`format=json` 时调 weapi 解析真实 CDN 地址
-- **pic**：优先使用 `src` 参数传入的真实 picUrl，否则本地计算网易云加密 ID 构造直链（MD5 + XOR magic string）
-- **lrc**：调 weapi 获取歌词，失败返回占位文本
-- **search**：多级回退 —— 方案1 weapi/cloudsearch（加密搜索），方案2 旧版 GET 搜索接口（无加密）
+为前端 [音乐馆](https://github.com/666mingqing6/Music) 提供跨设备播放计数同步：
+
+| 接口 | 方法 | 说明 |
+|------|------|------|
+| `/auth/register` | POST | 注册 `{username, password}` → `{token}`（注册即登录） |
+| `/auth/login` | POST | 登录 `{username, password}` → `{token}` |
+| `/auth/logout` | POST | 登出（Bearer），删除 session |
+| `/user/playcounts` | GET | 拉取全部播放计数（Bearer）→ `{counts}` |
+| `/user/playcounts` | PUT | 全量覆盖播放计数（Bearer）`{counts}`，幂等 |
+
+鉴权：`Authorization: Bearer <token>`，token 有效期 90 天。
+
+安全设计：
+- 密码 **PBKDF2-SHA256**（100k 迭代 + 随机盐 + 恒定时间比较）
+- 登录失败限流：同 IP 10 次 / 10 分钟锁定
+- counts 上传校验（key 格式、数值范围、最多 3000 条）
+
+song_key 稳定标识（歌单增删改序不影响计数）：
+- 网易云歌：`ne:{网易云歌曲ID}`（歌单内与搜索点播的同一首歌共享计数）
+- 本地音乐：`lo:{音频文件URL}`
+- 兜底：`ti:{歌名}|{歌手}`
 
 ## 525 封锁解决方案（核心）
 
@@ -76,16 +93,18 @@ https://meting-api.646474.xyz/?server=netease&type=url&id=186016&format=json
 ```bash
 npm install -g wrangler
 wrangler login
+wrangler d1 create meting-users                 # 首次：建库（记下 database_id 填入 wrangler.toml）
+wrangler d1 execute meting-users --file=./schema.sql --remote   # 建表
 wrangler deploy
 ```
 
 ### 方式二：Dashboard 手动
 
-Workers & Pages → Create Worker → 粘贴 `index.js` 内容 → Deploy
+Workers & Pages → Create Worker → 粘贴 `index.js` 内容 → Deploy，再在 Settings → Bindings 添加 D1 绑定（变量名 `DB`）。
 
 ### 方式三：Cloudflare API
 
-`PUT /accounts/{account_id}/workers/scripts/meting-api`，multipart 上传 `index.js`（metadata 指定 `main_module` 与 `compatibility_date`）。
+`PUT /accounts/{account_id}/workers/scripts/meting-api`，multipart 上传 `index.js`（metadata 指定 `main_module`、`compatibility_date` 与 d1 binding）。
 
 > ⚠️ **注意**：若通过 API multipart 上传，代码必须是**纯 ASCII**，否则中文注释会因编码问题损坏成 mojibake（曾导致线上故障）。本仓库的 `index.js` 已是纯 ASCII 源码——注释为英文，中文字符串用 `\uXXXX` 转义（如 `'\u6682\u65e0\u6b4c\u8bcd'` 渲染为「暂无歌词」），可安全上传。
 
@@ -107,4 +126,4 @@ Worker 默认域名 `*.workers.dev` 在国内无法解析（会被引导到错�
 |------|------|------|
 | Cloudflare Workers（v1） | ❌ 已弃用 | 网易云封锁 CF IP 段，525 错误，当时无回退方案 |
 | 腾讯云 EdgeOne | ❌ 已弃用 | 平台政策限制，无法正常运作 |
-| **Cloudflare Workers（v2，当前）** | ✅ 使用中 | `neteaseFetch` 直连 + 代理多级回退，彻底解决 525 |
+| **Cloudflare Workers（v2，当前）** | ✅ 使用中 | `neteaseFetch` 直连 + 代理多级回退解决 525；新增 D1 账户系统 |
