@@ -428,11 +428,16 @@ async function handlePic(id, src) {
   // Prefer the real picUrl passed via the src parameter (provided by playlist/song endpoints)
   if (src) {
     let url = decodeURIComponent(src);
-    url = url.replace(/param=\d+y\d+/, 'param=800y800');
-    if (!url.includes('param=')) {
-      url += (url.includes('?') ? '&' : '?') + 'param=800y800';
+    // Security: only allow NetEase image CDN hosts (fixes open redirect —
+    // src could otherwise be crafted to 302 to an arbitrary URL)
+    if (/^https?:\/\/[a-z0-9.-]+\.126\.net\//i.test(url)) {
+      url = url.replace(/param=\d+y\d+/, 'param=800y800');
+      if (!url.includes('param=')) {
+        url += (url.includes('?') ? '&' : '?') + 'param=800y800';
+      }
+      return url;
     }
-    return url;
+    // Non-whitelisted src: fall through to the encrypted-id path below
   }
 
   const encryptedId = neteaseEncryptId(id);
@@ -630,7 +635,7 @@ function sanitizeCounts(input) {
   return out;
 }
 
-async function handleUserApi(request, env) {
+async function handleUserApi(request, env, ctx) {
   const db = env.DB;
   if (!db) {
     return userJson({ error: 'D1 binding missing' }, 500);
@@ -644,9 +649,25 @@ async function handleUserApi(request, env) {
     return new Response(null, { headers: USER_CORS });
   }
 
+  // Probabilistic cleanup (~1% of requests): expired sessions and stale
+  // throttle rows would otherwise accumulate forever (they are only deleted
+  // lazily when touched). waitUntil keeps it off the response path.
+  if (ctx && Math.random() < 0.01) {
+    const now = Math.floor(Date.now() / 1000);
+    ctx.waitUntil(db.prepare('DELETE FROM sessions WHERE expires_at < ?').bind(now).run());
+    ctx.waitUntil(db.prepare('DELETE FROM login_throttle WHERE window_start < ?').bind(now - 3600).run());
+  }
+
   try {
     // ---- POST /auth/register ----
     if (path === '/auth/register' && request.method === 'POST') {
+      // Registration throttle (shared budget with login failures, per IP):
+      // every attempt consumes budget, otherwise scripts with valid payloads
+      // could mass-create accounts and flood D1
+      if (!(await throttleCheck(db, ip))) {
+        return userJson({ error: 'too many attempts, retry in 10 minutes' }, 429);
+      }
+      await throttleFail(db, ip);
       const body = await request.json().catch(() => null);
       const username = body && body.username;
       const password = body && body.password;
@@ -749,7 +770,7 @@ export default {
     const path = url.pathname;
     if (path === '/auth/register' || path === '/auth/login' ||
         path === '/auth/logout' || path === '/user/playcounts') {
-      return handleUserApi(request, env);
+      return handleUserApi(request, env, ctx);
     }
 
     // OPTIONS preflight (legacy meting API)
@@ -761,10 +782,12 @@ export default {
     const type = searchParams.get('type') || 'playlist';
     const id = searchParams.get('id');
 
-    // search uses the keyword parameter and needs no id; others require id
-    if (!id && type !== 'search') {
+    // search uses the keyword parameter and needs no id; others require a
+    // numeric id (all netease song/playlist/pic ids are digits — rejects
+    // garbage input before it reaches upstream requests)
+    if (type !== 'search' && (!id || !/^\d+$/.test(id))) {
       return new Response(
-        JSON.stringify({ error: 'missing id parameter' }),
+        JSON.stringify({ error: 'missing or invalid id parameter' }),
         { status: 400, headers: { ...CORS, 'Content-Type': 'application/json; charset=utf-8' } }
       );
     }
